@@ -17,48 +17,72 @@ Subnet = namedtuple('Subnet', ['cidr_block', 'name', 'dynamic'])
 SecurityGroupId = namedtuple('SecurityGroupId', ['id', 'region'])
 
 
-def get_rules(aws, app_map, regions, dynamic_subnets):
-    if not regions:
-        logger.info("Getting all regions")
-        regions = aws.all_regions()
-
+def collect_subnets(aws, regions, dynamic_subnets):
+    """Return a list of Subnet instances for each AWS subnet, sorted by IP."""
     logger.info("collecting subnets")
     subnets = []
-    managed_ip_space = IPSet([])
     for id, subnet in aws.get_all_subnets(regions).iteritems():
         name = subnet.tags.get('Name', id)
         dynamic = name in dynamic_subnets or id in dynamic_subnets
         cidr_block = IP(subnet.cidr_block)
         subnet = Subnet(cidr_block=cidr_block, name=name, dynamic=dynamic)
         subnets.append(subnet)
-        managed_ip_space = managed_ip_space + IPSet([cidr_block])
-    unmanaged_ip_space = IPSet([IP('0.0.0.0/0')]) - managed_ip_space
+    subnets.sort(key=lambda s: s.cidr_block)
+    return subnets
 
-    logger.info("collecting dynamic subnet IP ranges")
+
+def collect_subnet_ips(subnets):
+    """
+    Based on the given subnets, return
+
+     * dynamic_ipsets: a dictionary mapping subnet name to its IP space (as an
+       IPSet)
+
+     * per_host_subnet_ipset: an IPSet encompassing all per-host subnets
+    """
+    logger.info("collecting dynamic and per-host subnet IP ranges")
     dynamic_ipsets = {}
-    per_host_subnet_ips = IPSet()
+    per_host_subnet_ipset = IPSet()
     for subnet in subnets:
         if subnet.dynamic:
             ipset = dynamic_ipsets.get(subnet.name, IPSet([]))
             ipset += IPSet([subnet.cidr_block])
             dynamic_ipsets[subnet.name] = ipset
         else:
-            per_host_subnet_ips += IPSet([subnet.cidr_block])
+            # TODO: generate where this is used
+            per_host_subnet_ipset += IPSet([subnet.cidr_block])
+    return dynamic_ipsets, per_host_subnet_ipset
 
-    # sort by IP subnet, so we can use a binary search
-    logger.info("sorting subnets by IP")
-    subnets.sort(key=lambda s: s.cidr_block)
+
+def get_sgids(aws, regions, subnets):
+    """
+    Get the security group ids (SecurityGroupId instances, since AWS
+    "sg-XXXXXX" strings are local to a region) from AWS.  The following are
+    returned:
+
+     * sgids_by_dynamic_subnet: a dictionary mapping subnet name to set of
+       sgids
+
+     * sgids_by_instance: a dictionary mapping instance name to [instance ip,
+       set of sgids], for instances in per-host vlans only
+
+     * all_sgids: all discovered sgids, for dynamic or per-host
+
+     * ips_by_sg: dictionary mapping sgid to an IPSet of instances with that
+     group
+
+    """
+    logger.info("examining instances")
+
+    # take advantage of the fact that `subnets` is sorted by using binary search
     _subnet_blocks = [s.cidr_block for s in subnets]
-
     def subnet_by_ip(ip):
         i = bisect.bisect_right(_subnet_blocks, ip)
         if i and ip in _subnet_blocks[i - 1]:
             return subnets[i - 1]
 
-    logger.info("examining instances")
     sgids_by_dynamic_subnet = {}  # {subnet name: set of SecurityGroupIds}
     sgids_by_instance = {}  # {instance_name: [ip, set of SecurityGroupIds]}
-    all_sgids = set()
     ips_by_sg = {}  # {group id: IPSet}
     for id, instance in aws.get_all_instances(regions).iteritems():
         if instance.state == 'terminated' or instance.state == 'shutting-down':
@@ -93,7 +117,30 @@ def get_rules(aws, app_map, regions, dynamic_subnets):
         new_sgids = set(SecurityGroupId(g.id, instance.region.name)
                         for g in instance.groups)
         sgset.update(new_sgids)
-        all_sgids.update(new_sgids)
+    return sgids_by_dynamic_subnet, sgids_by_instance, ips_by_sg
+
+
+def get_rules(aws, app_map, regions, dynamic_subnets):
+    if not regions:
+        logger.info("Getting all regions")
+        regions = aws.all_regions()
+
+    subnets = collect_subnets(aws, regions, dynamic_subnets)
+
+    # distinguish managed IP space (in a subnet) from unmanaged (everything
+    # else)
+    managed_ip_space = sum((IPSet([subnet.cidr_block]) for subnet in subnets), IPSet([]))
+    unmanaged_ip_space = IPSet([IP('0.0.0.0/0')]) - managed_ip_space
+
+    dynamic_ipsets, per_host_subnet_ipset = collect_subnet_ips(subnets)
+
+    sgids_by_dynamic_subnet, sgids_by_instance, ips_by_sg = get_sgids(aws, regions, subnets)
+    all_sgids = reduce(lambda x, y: x | y,
+            sgids_by_dynamic_subnet.itervalues(),
+            set())
+    all_sgids |= reduce(lambda x, y: x | y,
+            (info[1] for info in sgids_by_instance.itervalues()),
+            set())
 
     logger.info("accumulating security groups")
     all_apps = set(app_map.values())
@@ -172,7 +219,7 @@ def get_rules(aws, app_map, regions, dynamic_subnets):
             make_rules(sgid, host_ip)
 
     logger.info("assuming unrestricted outbound access from unoccupied IPs in per-host subnets")
-    unoccupied = per_host_subnet_ips - per_host_host_ips
+    unoccupied = per_host_subnet_ipset - per_host_host_ips
     for app in all_apps:
         rules.setdefault(app, []).append(Rule(
             src=unoccupied, dst=unmanaged_ip_space, app=app, name='unoccupied/out'))
