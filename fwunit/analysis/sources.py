@@ -23,7 +23,10 @@ def _ipset(ip):
 
 class Source(object):
     def __init__(self, filename):
-        self.rules = types.from_jsonable(json.load(open(filename))['rules'])
+        data = json.load(open(filename))
+        self.rules = types.from_jsonable(data['rules'])
+        self.type = data.get('type', None)
+        self.metadata = data.get('metadata', {})
 
     def rulesForApp(self, app):
         try:
